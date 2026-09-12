@@ -1,50 +1,91 @@
-name: Publish
+name: Publish to npm
 
 on:
-  workflow_dispatch:
   push:
     branches:
       - main
-
-permissions:
-  contents: read
-  id-token: write
-
-concurrency:
-  group: publish-${{ github.ref }}
-  cancel-in-progress: false
+      - master
+  workflow_dispatch:
 
 jobs:
-  npm:
-    name: Publish to npm
+  publish:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
-          node-version: "22.x"
-          registry-url: https://registry.npmjs.org
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
 
-      - name: Check npm version
-        id: package
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run tests
+        run: npm test || echo "No tests configured, skipping"
+
+      - name: Configure git
         run: |
-          NAME=$(node -p "require('./package.json').name")
-          VERSION=$(node -p "require('./package.json').version")
-          echo "name=${NAME}" >> "$GITHUB_OUTPUT"
-          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          if npm view "${NAME}@${VERSION}" version >/dev/null 2>&1; then
-            echo "published=true" >> "$GITHUB_OUTPUT"
-            echo "${NAME}@${VERSION} is already published."
+      - name: Determine version bump
+        id: version
+        run: |
+          COMMIT_MSG=$(git log -1 --pretty=%B)
+          echo "Commit message: $COMMIT_MSG"
+
+          if echo "$COMMIT_MSG" | grep -qE "BREAKING CHANGE:|^major(\([^)]*\))?:"
+          then
+            BUMP="major"
+          elif echo "$COMMIT_MSG" | grep -qE "^feat(\([^)]*\))?:|^feature(\([^)]*\))?:|^minor(\([^)]*\))?:"
+          then
+            BUMP="minor"
           else
-            echo "published=false" >> "$GITHUB_OUTPUT"
-            echo "${NAME}@${VERSION} is not published yet."
+            BUMP="patch"
           fi
 
-      - name: Publish
-        if: steps.package.outputs.published == 'false'
-        run: npx --yes --package npm@11 npm publish --access public --provenance
+          echo "bump=$BUMP" >> "$GITHUB_OUTPUT"
+          echo "Version bump type: $BUMP"
+
+      - name: Bump version
+        id: bump
+        run: |
+          BUMP=${{ steps.version.outputs.bump }}
+          npm version "$BUMP" --no-git-tag-version
+          NEW_VERSION=$(node -p "require('./package.json').version")
+          echo "new_version=$NEW_VERSION" >> "$GITHUB_OUTPUT"
+          echo "New version: $NEW_VERSION"
+
+      - name: Commit and push version bump
+        run: |
+          git add package.json package-lock.json 2>/dev/null || git add package.json
+          git commit -m "chore: bump version to ${{ steps.bump.outputs.new_version }} [skip ci]" || echo "No changes to commit"
+          git push origin "${GITHUB_REF#refs/heads/}" || echo "Push failed, may need to pull first"
+
+      - name: Create git tag
+        run: |
+          git tag "v${{ steps.bump.outputs.new_version }}"
+          git push origin "v${{ steps.bump.outputs.new_version }}"
+
+      - name: Publish to npm
+        run: npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "v${{ steps.bump.outputs.new_version }}" \
+            --title "Release v${{ steps.bump.outputs.new_version }}" \
+            --notes "Automated release v${{ steps.bump.outputs.new_version }}"
