@@ -1,6 +1,9 @@
 /** @jsxImportSource @opentui/solid */
 import type { TextRenderable } from "@opentui/core"
 import type { TuiPlugin, TuiPluginModule } from "@opencode-ai/plugin/tui"
+import { appendFile, mkdir } from "node:fs/promises"
+import { homedir } from "node:os"
+import { dirname, join } from "node:path"
 import { onCleanup } from "solid-js"
 
 type StreamSample = {
@@ -31,9 +34,21 @@ type TrackerState = {
   streamSamplesBySession: Record<string, StreamSample[]>
   messageTimingByID: Record<string, MessageTiming>
   sessionAverageByID: Record<string, SessionAverage>
+  lastCompletedAtBySession: Record<string, number>
+  lastGapMsBySession: Record<string, number>
+  liveSamplesDroppedBySession: Record<string, boolean>
 }
 
 type TrackerListener = () => void
+
+const LOG_PATH =
+  process.env.ESUYO_TPS_LOG ?? join(homedir(), ".local/share/opencode", "esuyo-opencode-tks.log")
+
+async function logLine(obj: unknown) {
+  try {
+    await appendFile(LOG_PATH, JSON.stringify(obj) + "\n", "utf8")
+  } catch {}
+}
 
 function estimateStreamTokens(delta: string) {
   return Math.max(1, Math.ceil(Buffer.byteLength(delta, "utf8") / 5))
@@ -127,11 +142,18 @@ function SessionPromptRight(props: {
     return formatRate(total / durationSeconds)
   }
 
+  function lastGap() {
+    const ms = props.tracker.lastGapMsBySession[props.sessionID]
+    if (typeof ms !== "number" || ms < 0) return undefined
+    return ms >= 10000 ? `${(ms / 1000).toFixed(0)}s` : `${(ms / 1000).toFixed(1)}s`
+  }
+
   function statusText() {
     const live = liveTps() ?? "-"
     const avg = sessionAverage() ?? "-"
     const ttft = sessionTtft() ?? "-"
-    return `TPS ${live} | AVG ${avg} | TTFT ${ttft}`
+    const gap = lastGap() ?? "-"
+    return `TPS ${live} | AVG ${avg} | TTFT ${ttft} | GAP ${gap}`
   }
 }
 
@@ -140,8 +162,15 @@ const tui: TuiPlugin = async (api) => {
     streamSamplesBySession: {},
     messageTimingByID: {},
     sessionAverageByID: {},
+    lastCompletedAtBySession: {},
+    lastGapMsBySession: {},
+    liveSamplesDroppedBySession: {},
   }
   const listeners = new Set<TrackerListener>()
+
+  try {
+    await mkdir(dirname(LOG_PATH), { recursive: true })
+  } catch {}
 
   const bump = () => {
     for (const listener of listeners) listener()
@@ -165,6 +194,7 @@ const tui: TuiPlugin = async (api) => {
   const clearLiveSamples = (sessionID: string) => {
     if (!tracker.streamSamplesBySession[sessionID]?.length) return
     delete tracker.streamSamplesBySession[sessionID]
+    tracker.liveSamplesDroppedBySession[sessionID] = true
     bump()
   }
 
@@ -206,6 +236,11 @@ const tui: TuiPlugin = async (api) => {
 
     if (!evt.properties.info.time.completed) {
       const existing = tracker.messageTimingByID[evt.properties.info.id]
+      if (!existing) tracker.liveSamplesDroppedBySession[sessionID] = false
+      const prev = tracker.lastCompletedAtBySession[sessionID]
+      if (typeof prev === "number") {
+        tracker.lastGapMsBySession[sessionID] = Math.max(evt.properties.info.time.created - prev, 0)
+      }
       tracker.messageTimingByID[evt.properties.info.id] = {
         sessionID,
         requestStartAt: evt.properties.info.time.created,
@@ -240,9 +275,28 @@ const tui: TuiPlugin = async (api) => {
           totalTtftMs: totals.totalTtftMs + ttftMs,
           messageCount: totals.messageCount + 1,
         }
+        void logLine({
+          v: 1,
+          at: new Date(evt.properties.info.time.completed).toISOString(),
+          sessionID,
+          messageID: evt.properties.info.id,
+          finish: evt.properties.info.finish,
+          tokensOutput: evt.properties.info.tokens.output,
+          tokensReasoning: evt.properties.info.tokens.reasoning,
+          tokensTotal: totalTokens,
+          durationMs,
+          ttftMs,
+          gapMs: tracker.lastGapMsBySession[sessionID] ?? null,
+          avgTps: Number((totalTokens / (durationMs / 1000)).toFixed(2)),
+          liveSamplesDropped: tracker.liveSamplesDroppedBySession[sessionID] ?? false,
+        })
       }
     }
+    if (evt.properties.info.finish !== "tool-calls") {
+      tracker.lastCompletedAtBySession[sessionID] = evt.properties.info.time.completed
+    }
     delete tracker.messageTimingByID[evt.properties.info.id]
+    delete tracker.liveSamplesDroppedBySession[sessionID]
     pruneSamples(evt.properties.info.time.completed)
     bump()
   })
@@ -302,7 +356,7 @@ const tui: TuiPlugin = async (api) => {
 }
 
 const plugin: TuiPluginModule & { id: string } = {
-  id: "oc-tps",
+  id: "esuyo-opencode-tks",
   tui,
 }
 

@@ -1,0 +1,10 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "outDir": ".test-build",
+    "jsx": "react-jsx",
+    "declaration": false,
+    "sourceMap": false
+  }
+}

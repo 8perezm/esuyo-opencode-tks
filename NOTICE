@@ -1,0 +1,17 @@
+esuyo-opencode-tks
+==================
+
+This project is a fork of and is derived from:
+
+  Tarquinen/oc-tps
+  https://github.com/Tarquinen/oc-tps
+  commit 89bf5b87f933ee593e85e8458ee79195a9f59a75 (version 0.0.10)
+
+The upstream project did not declare a license at the time this fork was
+created. The original source is included here with full attribution and is
+used under the assumption of an MIT-compatible license; the original author
+retains all rights to their work. If upstream adds or changes its license,
+the attribution and license terms of this fork will be updated accordingly.
+
+New code and modifications in this fork are released under the MIT License
+(see LICENSE).
