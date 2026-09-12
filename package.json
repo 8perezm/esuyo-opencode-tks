@@ -1,7 +1,7 @@
 {
   "$schema": "https://json.schemastore.org/package.json",
   "name": "@esuyo/esuyo-opencode-tks",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Live TPS, average TPS, average TTFT, and response GAP metrics for OpenCode sessions, with optional JSONL stats logging.",
   "repository": {
     "type": "git",
