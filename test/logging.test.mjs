@@ -8,95 +8,96 @@ process.env.ESUYO_TPS_LOG = LOG
 rmSync(LOG, { force: true })
 
 const handlers = {}
-let dispose = () => {}
-const api = {
-  event: {
+const context = {
+  options: {},
+  data: {
     on: (name, cb) => {
       handlers[name] = cb
       return () => {}
     },
+    session: { status: () => "idle" },
   },
-  state: {
-    session: { status: () => ({ type: "idle" }) },
-    part: () => [{ id: "p1", type: "text" }],
-  },
-  slots: { register: () => {} },
-  lifecycle: { onDispose: (fn) => (dispose = fn) },
+  ui: { slot: () => () => {} },
+  theme: { text: { base: "#ffffff", muted: "#ffffff" } },
   renderer: { requestRender: () => {} },
-  theme: { current: { textMuted: "#ffffff" } },
 }
 
 const mod = await import(new URL("../.test-build/tui.js", import.meta.url).href)
-await mod.default.tui(api)
 
-const delta = (sessionID, messageID) =>
-  handlers["message.part.delta"]({
-    properties: { sessionID, messageID, partID: "p1", field: "text", delta: "hello world" },
+assert.equal(typeof mod.default, "object", "default export is a V2 plugin module")
+assert.equal(typeof mod.default.id, "string", "plugin has an id")
+assert.equal(typeof mod.default.setup, "function", "plugin has setup")
+
+const cleanup = await mod.default.setup(context)
+
+const step = (sessionID, id, created) =>
+  handlers["session.step.started"]({
+    created,
+    data: { sessionID, assistantMessageID: id, agent: "build", model: {}, snapshot: "snap", started: created },
   })
 
-const start = (sessionID, id, created) =>
-  handlers["message.updated"]({
-    properties: {
+const delta = (sessionID, id) =>
+  handlers["session.text.delta"]({
+    created: Date.now(),
+    data: { sessionID, assistantMessageID: id, ordinal: 0, delta: "hello world" },
+  })
+
+const tool = (sessionID, id, created) =>
+  handlers["session.tool.called"]({
+    created,
+    data: { sessionID, assistantMessageID: id, id: "call_1", input: {}, executed: true, state: {} },
+  })
+
+const end = (sessionID, id, created, output, reasoning, finish = "stop") =>
+  handlers["session.step.ended"]({
+    created,
+    data: {
       sessionID,
-      info: { role: "assistant", sessionID, id, time: { created }, tokens: { output: 0, reasoning: 0 } },
+      assistantMessageID: id,
+      finish,
+      rawFinish: finish,
+      providerState: {},
+      cost: 0,
+      tokens: { input: 0, output, reasoning, cache: { read: 0, write: 0 } },
+      snapshot: "snap",
+      files: [],
     },
   })
 
-const complete = (sessionID, id, created, completed, output, reasoning, finish = "stop") =>
-  handlers["message.updated"]({
-    properties: {
-      sessionID,
-      info: {
-        role: "assistant",
-        sessionID,
-        id,
-        finish,
-        time: { created, completed },
-        tokens: { output, reasoning },
-      },
-    },
-  })
-
-const toolRunning = (sessionID, messageID, startAt) =>
-  handlers["message.part.updated"]({
-    properties: {
-      part: {
-        type: "tool",
-        sessionID,
-        messageID,
-        state: { status: "running", time: { start: startAt } },
-      },
-      time: startAt,
-    },
-  })
-
-start("s1", "m1", 1000)
+step("s1", "m1", 1000)
 delta("s1", "m1")
-complete("s1", "m1", 1000, 5000, 100, 20)
+end("s1", "m1", 5000, 100, 20)
 
-start("s1", "m2", 20000)
+step("s1", "m2", 20000)
 delta("s1", "m2")
-complete("s1", "m2", 20000, 26000, 80, 10)
+end("s1", "m2", 26000, 80, 10)
 
-start("s1", "m3", 27000)
+step("s1", "m3", 27000)
 delta("s1", "m3")
-toolRunning("s1", "m3", 29000)
-complete("s1", "m3", 27000, 30000, 40, 5, "tool-calls")
+tool("s1", "m3", 29000)
+end("s1", "m3", 30000, 40, 5, "tool-calls")
 
-start("s1", "m4", 35000)
+step("s1", "m4", 35000)
 delta("s1", "m4")
-complete("s1", "m4", 35000, 40000, 60, 0)
+end("s1", "m4", 40000, 60, 0)
 
-start("s2", "m5", 100000)
+step("s2", "m5", 100000)
 delta("s2", "m5")
-complete("s2", "m5", 100000, 105000, 50, 0)
+end("s2", "m5", 105000, 50, 0)
 
-handlers["message.updated"]({
-  properties: { sessionID: "s1", info: { role: "user", sessionID: "s1", id: "u1", time: { created: 41000 } } },
-})
+// Two steps of the same assistant message share one GAP.
+step("s2", "m6", 110000)
+delta("s2", "m6")
+tool("s2", "m6", 112000)
+end("s2", "m6", 113000, 10, 0, "tool-calls")
+step("s2", "m6", 115000)
+delta("s2", "m6")
+end("s2", "m6", 118000, 20, 0)
+
+handlers["session.execution.interrupted"]({ created: 120000, data: { sessionID: "s1", reason: "user" } })
 
 await new Promise((resolve) => setTimeout(resolve, 200))
-dispose()
+cleanup()
 
 const parsed = readFileSync(LOG, "utf8")
   .trim()
@@ -106,12 +107,13 @@ const parsed = readFileSync(LOG, "utf8")
 
 const byID = Object.fromEntries(parsed.map((entry) => [entry.messageID, entry]))
 
-assert.equal(parsed.length, 5, "one JSONL line per assistant completion")
+assert.equal(parsed.length, 7, "one JSONL line per completed step")
 assert.equal(byID.m1.gapMs, null, "first message has no gap")
 assert.equal(byID.m2.gapMs, 15000, "gap between final completions")
 assert.equal(byID.m3.gapMs, 1000, "gap tracked across tool-call message")
 assert.equal(byID.m4.gapMs, 9000, "tool-calls completion does not reset last completion")
 assert.equal(byID.m5.gapMs, null, "sessions do not leak gap state")
+assert.equal(byID.m6.gapMs, 5000, "later steps of one message reuse its gap")
 assert.equal(byID.m1.v, 1, "schema version")
 assert.equal(byID.m1.tokensTotal, 120, "output + reasoning tokens")
 assert.equal(typeof byID.m1.avgTps, "number", "avgTps is numeric")

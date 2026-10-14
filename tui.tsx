@@ -1,10 +1,9 @@
 /** @jsxImportSource @opentui/solid */
-import type { TextRenderable } from "@opentui/core"
-import type { TuiPlugin, TuiPluginModule } from "@opencode-ai/plugin/tui"
+import { Plugin } from "@opencode/plugin/tui"
 import { appendFile, mkdir } from "node:fs/promises"
 import { homedir } from "node:os"
 import { dirname, join } from "node:path"
-import { onCleanup } from "solid-js"
+import { createSignal } from "solid-js"
 
 type StreamSample = {
   at: number
@@ -14,11 +13,12 @@ type StreamSample = {
 const STREAM_WINDOW_MS = 5_000
 const LIVE_STALE_MS = 1_500
 const SINGLE_SAMPLE_MS = 1_000
-type MessageTiming = {
+
+/** Timing of one model step. Keyed by the assistant message that owns it. */
+type StepTiming = {
   sessionID: string
   requestStartAt: number
   firstResponseAt?: number
-  firstTokenAt?: number
   lastTokenAt?: number
   lastToolCallAt?: number
 }
@@ -27,19 +27,18 @@ type SessionAverage = {
   totalTokens: number
   totalDurationMs: number
   totalTtftMs: number
-  messageCount: number
+  stepCount: number
 }
 
 type TrackerState = {
   streamSamplesBySession: Record<string, StreamSample[]>
-  messageTimingByID: Record<string, MessageTiming>
+  timingByMessage: Record<string, StepTiming>
+  openMessages: Record<string, boolean>
   sessionAverageByID: Record<string, SessionAverage>
   lastCompletedAtBySession: Record<string, number>
   lastGapMsBySession: Record<string, number>
   liveSamplesDroppedBySession: Record<string, boolean>
 }
-
-type TrackerListener = () => void
 
 const LOG_PATH =
   process.env.ESUYO_TPS_LOG ?? join(homedir(), ".local/share/opencode", "esuyo-opencode-tks.log")
@@ -85,279 +84,273 @@ function activeDurationMs(samples: StreamSample[], tailAt?: number) {
   return Math.max(duration, SINGLE_SAMPLE_MS)
 }
 
-function SessionPromptRight(props: {
-  api: Parameters<TuiPlugin>[0]
-  sessionID: string
-  tracker: TrackerState
-  subscribe: (listener: TrackerListener) => () => void
-}) {
-  let text: TextRenderable | undefined
-
-  const sync = () => {
-    if (!text) return
-    text.content = statusText()
-    props.api.renderer.requestRender()
-  }
-
-  const unsubscribe = props.subscribe(sync)
-  onCleanup(unsubscribe)
-
-  return (
-    <text
-      ref={(ref: TextRenderable) => {
-        text = ref
-        sync()
-      }}
-      fg={props.api.theme.current.textMuted}
-    >
-      {statusText()}
-    </text>
-  )
-
-  function sessionAverage() {
-    const totals = props.tracker.sessionAverageByID[props.sessionID]
-    if (!totals || totals.totalTokens <= 0 || totals.totalDurationMs <= 0) return undefined
-    return formatRate(totals.totalTokens / (totals.totalDurationMs / 1000))
-  }
-
-  function sessionTtft() {
-    const totals = props.tracker.sessionAverageByID[props.sessionID]
-    if (!totals || totals.messageCount <= 0 || totals.totalTtftMs < 0) return undefined
-    return formatTtft(totals.totalTtftMs / totals.messageCount / 1000)
-  }
-
-  function liveTps() {
-    const status = props.api.state.session.status(props.sessionID)
-    if (status?.type === "idle") return undefined
-    const samples = props.tracker.streamSamplesBySession[props.sessionID] ?? []
-    if (samples.length === 0) return undefined
-    const now = Date.now()
-    const relevant = samples.filter((sample) => now - sample.at <= STREAM_WINDOW_MS)
-    if (relevant.length === 0) return undefined
-    const lastSample = relevant[relevant.length - 1]
-    if (!lastSample || now - lastSample.at > LIVE_STALE_MS) return undefined
-    const total = relevant.reduce((sum, sample) => sum + sample.tokens, 0)
-    const durationSeconds = activeDurationMs(relevant, now) / 1000
-    if (durationSeconds <= 0) return undefined
-    return formatRate(total / durationSeconds)
-  }
-
-  function lastGap() {
-    const ms = props.tracker.lastGapMsBySession[props.sessionID]
-    if (typeof ms !== "number" || ms < 0) return undefined
-    return ms >= 10000 ? `${(ms / 1000).toFixed(0)}s` : `${(ms / 1000).toFixed(1)}s`
-  }
-
-  function statusText() {
-    const live = liveTps() ?? "-"
-    const avg = sessionAverage() ?? "-"
-    const ttft = sessionTtft() ?? "-"
-    const gap = lastGap() ?? "-"
-    return `TPS ${live} | AVG ${avg} | TTFT ${ttft} | GAP ${gap}`
-  }
-}
-
-const tui: TuiPlugin = async (api) => {
-  const tracker: TrackerState = {
-    streamSamplesBySession: {},
-    messageTimingByID: {},
-    sessionAverageByID: {},
-    lastCompletedAtBySession: {},
-    lastGapMsBySession: {},
-    liveSamplesDroppedBySession: {},
-  }
-  const listeners = new Set<TrackerListener>()
-
-  try {
-    await mkdir(dirname(LOG_PATH), { recursive: true })
-  } catch {}
-
-  const bump = () => {
-    for (const listener of listeners) listener()
-  }
-
-  const pruneSamples = (now = Date.now()) => {
-    let changed = false
-
-    for (const [sessionID, samples] of Object.entries(tracker.streamSamplesBySession)) {
-      const next = samples.filter((sample) => now - sample.at <= STREAM_WINDOW_MS)
-      if (next.length !== samples.length) {
-        changed = true
-        if (next.length > 0) tracker.streamSamplesBySession[sessionID] = next
-        else delete tracker.streamSamplesBySession[sessionID]
-      }
-    }
-
-    if (changed) bump()
-  }
-
-  const clearLiveSamples = (sessionID: string) => {
-    if (!tracker.streamSamplesBySession[sessionID]?.length) return
-    delete tracker.streamSamplesBySession[sessionID]
-    tracker.liveSamplesDroppedBySession[sessionID] = true
-    bump()
-  }
-
-  const appendSample = (sessionID: string, messageID: string, sample: StreamSample) => {
-    const now = sample.at
-    tracker.streamSamplesBySession[sessionID] = [
-      ...(tracker.streamSamplesBySession[sessionID] ?? []).filter((item) => now - item.at <= STREAM_WINDOW_MS),
-      sample,
-    ]
-    const timing = tracker.messageTimingByID[messageID]
-    if (timing) {
-      tracker.messageTimingByID[messageID] = timing.firstTokenAt
-        ? { ...timing, lastTokenAt: now }
-        : {
-            ...timing,
-            firstResponseAt: timing.firstResponseAt ?? now,
-            firstTokenAt: now,
-            lastTokenAt: now,
-          }
-    }
-    bump()
-  }
-
-  const onDelta = api.event.on("message.part.delta", (evt) => {
-    if (evt.properties.field !== "text") return
-    const parts = api.state.part(evt.properties.messageID)
-    const part = parts.find((item) => item.id === evt.properties.partID)
-    if (!part) return
-    if (part.type !== "text" && part.type !== "reasoning") return
-    appendSample(evt.properties.sessionID, evt.properties.messageID, {
-      at: Date.now(),
-      tokens: estimateStreamTokens(evt.properties.delta),
-    })
-  })
-
-  const onMessage = api.event.on("message.updated", (evt) => {
-    if (evt.properties.info.role !== "assistant") return
-    const sessionID = evt.properties.info.sessionID ?? evt.properties.sessionID
-
-    if (!evt.properties.info.time.completed) {
-      const existing = tracker.messageTimingByID[evt.properties.info.id]
-      if (!existing) tracker.liveSamplesDroppedBySession[sessionID] = false
-      const prev = tracker.lastCompletedAtBySession[sessionID]
-      if (typeof prev === "number") {
-        tracker.lastGapMsBySession[sessionID] = Math.max(evt.properties.info.time.created - prev, 0)
-      }
-      tracker.messageTimingByID[evt.properties.info.id] = {
-        sessionID,
-        requestStartAt: evt.properties.info.time.created,
-        firstResponseAt: existing?.firstResponseAt,
-        firstTokenAt: existing?.firstTokenAt,
-        lastTokenAt: existing?.lastTokenAt,
-        lastToolCallAt: existing?.lastToolCallAt,
-      }
-      bump()
-      return
-    }
-
-    const timing = tracker.messageTimingByID[evt.properties.info.id]
-    if (timing?.sessionID === sessionID && typeof timing.firstResponseAt === "number") {
-      const totalTokens = evt.properties.info.tokens.output + evt.properties.info.tokens.reasoning
-      const endAt =
-        evt.properties.info.finish === "tool-calls"
-          ? timing.lastToolCallAt
-          : evt.properties.info.time.completed
-      const durationMs = typeof endAt === "number" ? Math.max(endAt - timing.firstResponseAt, 1) : undefined
-      const ttftMs = Math.max(timing.firstResponseAt - timing.requestStartAt, 0)
-      if (totalTokens > 0 && durationMs) {
-        const totals = tracker.sessionAverageByID[sessionID] ?? {
-          totalTokens: 0,
-          totalDurationMs: 0,
-          totalTtftMs: 0,
-          messageCount: 0,
-        }
-        tracker.sessionAverageByID[sessionID] = {
-          totalTokens: totals.totalTokens + totalTokens,
-          totalDurationMs: totals.totalDurationMs + durationMs,
-          totalTtftMs: totals.totalTtftMs + ttftMs,
-          messageCount: totals.messageCount + 1,
-        }
-        void logLine({
-          v: 1,
-          at: new Date(evt.properties.info.time.completed).toISOString(),
-          sessionID,
-          messageID: evt.properties.info.id,
-          finish: evt.properties.info.finish,
-          tokensOutput: evt.properties.info.tokens.output,
-          tokensReasoning: evt.properties.info.tokens.reasoning,
-          tokensTotal: totalTokens,
-          durationMs,
-          ttftMs,
-          gapMs: tracker.lastGapMsBySession[sessionID] ?? null,
-          avgTps: Number((totalTokens / (durationMs / 1000)).toFixed(2)),
-          liveSamplesDropped: tracker.liveSamplesDroppedBySession[sessionID] ?? false,
-        })
-      }
-    }
-    if (evt.properties.info.finish !== "tool-calls") {
-      tracker.lastCompletedAtBySession[sessionID] = evt.properties.info.time.completed
-    }
-    delete tracker.messageTimingByID[evt.properties.info.id]
-    delete tracker.liveSamplesDroppedBySession[sessionID]
-    pruneSamples(evt.properties.info.time.completed)
-    bump()
-  })
-
-  const onPart = api.event.on("message.part.updated", (evt) => {
-    if (evt.properties.part.type !== "tool") return
-    const sessionID = evt.properties.part.sessionID ?? evt.properties.sessionID
-    if (
-      evt.properties.part.state.status === "running" ||
-      evt.properties.part.state.status === "completed" ||
-      evt.properties.part.state.status === "error"
-    ) {
-      clearLiveSamples(sessionID)
-    }
-    const timing = tracker.messageTimingByID[evt.properties.part.messageID]
-    if (!timing) return
-    if (evt.properties.part.state.status === "pending") {
-      tracker.messageTimingByID[evt.properties.part.messageID] = {
-        ...timing,
-        firstResponseAt: timing.firstResponseAt ?? evt.properties.time,
-      }
-      bump()
-      return
-    }
-    if (evt.properties.part.state.status !== "running") return
-    tracker.messageTimingByID[evt.properties.part.messageID] = {
-      ...timing,
-      lastToolCallAt: evt.properties.part.state.time.start,
-    }
-    bump()
-  })
-
-  const timer = setInterval(() => {
-    pruneSamples()
-    bump()
-  }, 1000)
-
-  api.lifecycle.onDispose(() => {
-    onDelta()
-    onMessage()
-    onPart()
-    clearInterval(timer)
-  })
-
-  api.slots.register({
-    slots: {
-      session_prompt_right(_ctx, value) {
-        return <SessionPromptRight api={api} sessionID={value.session_id} tracker={tracker} subscribe={(listener) => {
-          listeners.add(listener)
-          return () => {
-            listeners.delete(listener)
-          }
-        }} />
-      },
-    },
-  })
-}
-
-const plugin: TuiPluginModule & { id: string } = {
+const plugin: Plugin.Definition = Plugin.define({
   id: "esuyo-opencode-tks",
-  tui,
-}
+  async setup(context) {
+    const tracker: TrackerState = {
+      streamSamplesBySession: {},
+      timingByMessage: {},
+      openMessages: {},
+      sessionAverageByID: {},
+      lastCompletedAtBySession: {},
+      lastGapMsBySession: {},
+      liveSamplesDroppedBySession: {},
+    }
+
+    // Bumped on every tracker change so the slot re-renders.
+    const [tick, bumpTick] = createSignal(0)
+    const bump = () => bumpTick((value) => value + 1)
+
+    try {
+      await mkdir(dirname(LOG_PATH), { recursive: true })
+    } catch {}
+
+    const stamp = (event: { created: number }) =>
+      Number.isFinite(event.created) ? event.created : Date.now()
+
+    const pruneSamples = (now = Date.now()) => {
+      let changed = false
+
+      for (const [sessionID, samples] of Object.entries(tracker.streamSamplesBySession)) {
+        const next = samples.filter((sample) => now - sample.at <= STREAM_WINDOW_MS)
+        if (next.length !== samples.length) {
+          changed = true
+          if (next.length > 0) tracker.streamSamplesBySession[sessionID] = next
+          else delete tracker.streamSamplesBySession[sessionID]
+        }
+      }
+
+      if (changed) bump()
+    }
+
+    const clearLiveSamples = (sessionID: string) => {
+      if (!tracker.streamSamplesBySession[sessionID]?.length) return
+      delete tracker.streamSamplesBySession[sessionID]
+      tracker.liveSamplesDroppedBySession[sessionID] = true
+      bump()
+    }
+
+    const appendSample = (sessionID: string, messageID: string, sample: StreamSample) => {
+      const now = sample.at
+      tracker.streamSamplesBySession[sessionID] = [
+        ...(tracker.streamSamplesBySession[sessionID] ?? []).filter(
+          (item) => now - item.at <= STREAM_WINDOW_MS,
+        ),
+        sample,
+      ]
+      const timing = tracker.timingByMessage[messageID]
+      if (timing) {
+        tracker.timingByMessage[messageID] = timing.firstResponseAt
+          ? { ...timing, lastTokenAt: now }
+          : {
+              ...timing,
+              firstResponseAt: now,
+              lastTokenAt: now,
+            }
+      }
+      bump()
+    }
+
+    const dropSession = (sessionID: string) => {
+      clearLiveSamples(sessionID)
+      for (const [messageID, timing] of Object.entries(tracker.timingByMessage)) {
+        if (timing.sessionID !== sessionID) continue
+        delete tracker.timingByMessage[messageID]
+        delete tracker.openMessages[messageID]
+      }
+      bump()
+    }
+
+    const stops: Array<() => void> = []
+
+    const sampleDelta = (
+      sessionID: string,
+      messageID: string,
+      delta: string,
+    ) => {
+      appendSample(sessionID, messageID, {
+        at: Date.now(),
+        tokens: estimateStreamTokens(delta),
+      })
+    }
+
+    stops.push(
+      context.data.on("session.text.delta", (event) =>
+        sampleDelta(event.data.sessionID, event.data.assistantMessageID, event.data.delta),
+      ),
+    )
+
+    stops.push(
+      context.data.on("session.reasoning.delta", (event) =>
+        sampleDelta(event.data.sessionID, event.data.assistantMessageID, event.data.delta),
+      ),
+    )
+
+    stops.push(
+      context.data.on("session.step.started", (event) => {
+        const { sessionID, assistantMessageID } = event.data
+        const now = stamp(event)
+
+        // GAP is measured per assistant message, not per step, so only the
+        // first step of a message opens a new one.
+        if (!tracker.openMessages[assistantMessageID]) {
+          tracker.openMessages[assistantMessageID] = true
+          tracker.liveSamplesDroppedBySession[sessionID] = false
+          const previous = tracker.lastCompletedAtBySession[sessionID]
+          if (typeof previous === "number") {
+            tracker.lastGapMsBySession[sessionID] = Math.max(now - previous, 0)
+          }
+        }
+
+        tracker.timingByMessage[assistantMessageID] = { sessionID, requestStartAt: now }
+        bump()
+      }),
+    )
+
+    stops.push(
+      context.data.on("session.step.ended", (event) => {
+        const { sessionID, assistantMessageID, finish, tokens } = event.data
+        const now = stamp(event)
+        const timing = tracker.timingByMessage[assistantMessageID]
+        delete tracker.timingByMessage[assistantMessageID]
+
+        if (!timing) {
+          bump()
+          return
+        }
+
+        const totalTokens = tokens.output + tokens.reasoning
+        if (typeof timing.firstResponseAt === "number" && totalTokens > 0) {
+          const endAt = finish === "tool-calls" ? (timing.lastToolCallAt ?? now) : now
+          const durationMs = Math.max(endAt - timing.firstResponseAt, 1)
+          const ttftMs = Math.max(timing.firstResponseAt - timing.requestStartAt, 0)
+          const totals = tracker.sessionAverageByID[sessionID] ?? {
+            totalTokens: 0,
+            totalDurationMs: 0,
+            totalTtftMs: 0,
+            stepCount: 0,
+          }
+          tracker.sessionAverageByID[sessionID] = {
+            totalTokens: totals.totalTokens + totalTokens,
+            totalDurationMs: totals.totalDurationMs + durationMs,
+            totalTtftMs: totals.totalTtftMs + ttftMs,
+            stepCount: totals.stepCount + 1,
+          }
+          void logLine({
+            v: 1,
+            at: new Date(now).toISOString(),
+            sessionID,
+            messageID: assistantMessageID,
+            finish,
+            tokensOutput: tokens.output,
+            tokensReasoning: tokens.reasoning,
+            tokensTotal: totalTokens,
+            durationMs,
+            ttftMs,
+            gapMs: tracker.lastGapMsBySession[sessionID] ?? null,
+            avgTps: Number((totalTokens / (durationMs / 1000)).toFixed(2)),
+            liveSamplesDropped: tracker.liveSamplesDroppedBySession[sessionID] ?? false,
+          })
+        }
+
+        // Intermediate tool-call steps do not reset the GAP baseline.
+        if (finish !== "tool-calls") {
+          tracker.lastCompletedAtBySession[sessionID] = now
+          delete tracker.openMessages[assistantMessageID]
+        }
+        delete tracker.liveSamplesDroppedBySession[sessionID]
+        pruneSamples(now)
+        bump()
+      }),
+    )
+
+    stops.push(
+      context.data.on("session.step.failed", (event) => {
+        delete tracker.timingByMessage[event.data.assistantMessageID]
+        delete tracker.openMessages[event.data.assistantMessageID]
+        bump()
+      }),
+    )
+
+    stops.push(
+      context.data.on("session.tool.called", (event) => {
+        const { sessionID, assistantMessageID } = event.data
+        const now = stamp(event)
+        clearLiveSamples(sessionID)
+        const timing = tracker.timingByMessage[assistantMessageID]
+        if (!timing) return
+        timing.firstResponseAt = timing.firstResponseAt ?? now
+        timing.lastToolCallAt = now
+        bump()
+      }),
+    )
+
+    stops.push(context.data.on("session.execution.interrupted", (event) => dropSession(event.data.sessionID)))
+    stops.push(context.data.on("session.execution.failed", (event) => dropSession(event.data.sessionID)))
+
+    const timer = setInterval(() => {
+      pruneSamples()
+      bump()
+    }, 1000)
+
+    const sessionAverage = (sessionID: string) => {
+      const totals = tracker.sessionAverageByID[sessionID]
+      if (!totals || totals.totalTokens <= 0 || totals.totalDurationMs <= 0) return undefined
+      return formatRate(totals.totalTokens / (totals.totalDurationMs / 1000))
+    }
+
+    const sessionTtft = (sessionID: string) => {
+      const totals = tracker.sessionAverageByID[sessionID]
+      if (!totals || totals.stepCount <= 0 || totals.totalTtftMs < 0) return undefined
+      return formatTtft(totals.totalTtftMs / totals.stepCount / 1000)
+    }
+
+    const liveTps = (sessionID: string) => {
+      if (context.data.session.status(sessionID) === "idle") return undefined
+      const samples = tracker.streamSamplesBySession[sessionID] ?? []
+      if (samples.length === 0) return undefined
+      const now = Date.now()
+      const relevant = samples.filter((sample) => now - sample.at <= STREAM_WINDOW_MS)
+      if (relevant.length === 0) return undefined
+      const lastSample = relevant[relevant.length - 1]
+      if (!lastSample || now - lastSample.at > LIVE_STALE_MS) return undefined
+      const total = relevant.reduce((sum, sample) => sum + sample.tokens, 0)
+      const durationSeconds = activeDurationMs(relevant, now) / 1000
+      if (durationSeconds <= 0) return undefined
+      return formatRate(total / durationSeconds)
+    }
+
+    const lastGap = (sessionID: string) => {
+      const ms = tracker.lastGapMsBySession[sessionID]
+      if (typeof ms !== "number" || ms < 0) return undefined
+      return ms >= 10000 ? `${(ms / 1000).toFixed(0)}s` : `${(ms / 1000).toFixed(1)}s`
+    }
+
+    const statusText = (sessionID: string) => {
+      // Reading the tick subscribes this text to tracker changes.
+      tick()
+      const live = liveTps(sessionID) ?? "-"
+      const avg = sessionAverage(sessionID) ?? "-"
+      const ttft = sessionTtft(sessionID) ?? "-"
+      const gap = lastGap(sessionID) ?? "-"
+      return `TPS ${live} | AVG ${avg} | TTFT ${ttft} | GAP ${gap}`
+    }
+
+    const unregister = context.ui.slot({
+      append: "prompt.footer.status",
+      render: (input) => {
+        const sessionID = input.sessionID
+        if (!sessionID) return null
+        return <text fg={context.theme.text.muted}>{statusText(sessionID)}</text>
+      },
+    })
+
+    return () => {
+      unregister()
+      clearInterval(timer)
+      for (const stop of stops) stop()
+    }
+  },
+})
 
 export default plugin
